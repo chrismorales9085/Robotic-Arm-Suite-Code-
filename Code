@@ -1,0 +1,481 @@
+#include <SoftwareSerial.h>
+#include <Servo.h>
+#include <LetterCoordinates.h>
+
+// ===== Motor Tuning =====
+// Motor pins for L298N motor drivers [Base (1) | Shoulder (2) | Elbow (3) | Wrist (4) | Rotator (5) | Gripper (6) ]
+int motorPins[] = {51, 50, 52, 53, 23, 22, 24, 25, 5, 6, 7, 8};
+// Enable pins for L298N motor drivers [enA | enB] [Base (1) | Shoulder (2) | Elbow (3) | Wrist (4) | Rotator (5) | Gripper (6) ] [must be PWM pins]
+int enablePins[] = {2, -1, -1, -1, 3, -1};
+// Default motor speeds for motors 1 - 6 [Base (1) | Shoulder (2) | Elbow (3) | Wrist (4) | Rotator (5) | Gripper (6) ]
+float motorSpeeds[] = {126.5, 126.5, 126.5, 126.5, 126.5, 126.5}; 
+float gobildaSpeedMin = 51;
+
+// ===== Angles =====
+// Angles to move to for links [Base (1) | Shoulder (2) | Elbow (3) | Wrist (4) | Rotator (5) | Gripper (6) ]
+int linkAngles[] = {0, 0, 0, 0, 0, 0};
+
+// Last recorded angles for the links, and the default angles on startup [Base (1) | Shoulder (2) | Elbow (3) | Wrist (4) | Rotator (5) | Gripper (6) ]
+int lastLinkAngles[] = {0,0, 0, 0, 0, 0};
+
+// Limits for joints
+int maxLinkAngles[] = {180, 180, 180, 180, 180, 184.15}; 
+int zeroLinkAngles[] = {0,0, 0, 0, 0, 0}; 
+
+// Last recorded angles for the links, and the default angles on startup [Base (1) | Shoulder (2) | Elbow (3) | Wrist (4) | Rotator (5) | Gripper (6) ]
+int limitLinkAngles[] = {-180, -180, -180, -180, -180, 0}; 
+
+bool validAngle = false;
+int degreeLimit[] = {30, 10, 10, 10, 10, 30, 9.75};                       // Smallest degree joint can rotate withough having to double-back
+float msPerDeg[] = {45, 150, 88.9, 50, 8.33333, 133.56};   // Milliseconds it takes the motor to turn one degree;                // Minimum analog value for the Gobilda Motor
+
+
+// ===== KEYBOARD =====
+LetterCoordinates mapper;
+int currentRow;
+int currentColumn;
+float currentOffset;
+float lenBetweenKey = 19.5;
+
+// ===== SERVO TUNING =====
+Servo drive;
+
+const int SERVO_PIN = 11;
+const int NEUTRAL   = 90;
+const int DEADBAND  = 3;
+const int MAX_DELTA = 60;
+const float SECONDS_PER_REV = 1.25;
+
+float runMs = 800;
+
+int servoDelay = 500; 
+
+// =======================
+
+// ACS712 - 30A Current Reader
+#define ACS_PIN A0                          // Pin for ACS712 board [must be analog]
+
+const float VREF = 5.0;                     // Arduino analog reference
+const float SENSITIVITY = 0.066;            // ACS712-30A (V/A)
+const int ADC_MAX = 1023;
+
+float zeroOffset = 2.5;
+float gripSensitivities[] = {0.05, 0.1, 0.15};
+float currentGrip;
+float current;
+
+bool currentCheck = false;
+float currentDelay = 1000;
+float lastCurrent;
+
+// Empty (Don't Change)
+char action;
+char firstChar;
+int motor;
+int selectedPins[2];
+
+
+void setSpeed(float speed) {
+  speed = constrain(speed, -1.0, 1.0);
+
+  if (abs(speed) < 0.05) {
+    drive.write(NEUTRAL);
+    return;
+  }
+
+  int delta = max(DEADBAND, (int)(abs(speed) * MAX_DELTA));
+  int cmd = NEUTRAL + (speed > 0 ? delta : -delta);
+
+  drive.write(constrain(cmd, 0, 180));
+}
+
+void setup() {
+  //Motor pins definition
+  for (int i = 0; i < (int)(sizeof(motorPins)/sizeof(motorPins[0])); i++) {
+  pinMode(motorPins[i], OUTPUT);
+  }
+
+  for (int i = 0; i < sizeof(enablePins); i++){
+    pinMode(enablePins[i], OUTPUT);
+    analogWrite(enablePins[i], motorSpeeds[i]);
+  }  
+
+  for (int i = 0; i < sizeof(zeroLinkAngles); i++){
+    lastLinkAngles[i] = zeroLinkAngles[i];   
+  }  
+  
+  drive.attach(SERVO_PIN);
+  setSpeed(0);
+  
+
+  Serial.begin(9600);
+
+  Serial.println("Welcome to the Robotic Arm Controller!");
+  Serial.println(" ");
+  Serial.println("DC motor commands ('1f', '2b', '3s') [motor # + command]");
+  Serial.println("Commands [f - forward; b - backwards; s - stop; m - increase motor speed; l - decrease motor speed]");
+  Serial.println(" ");
+  Serial.println("DC angle commands ('190') [motor # + angle to move to]");
+  Serial.println(" ");
+  Serial.println("Servo commands ('sf', 'sb')");
+  
+  Serial.println(" ");
+
+  calibrateACS712();
+  currentGrip = gripSensitivities[0];
+}
+
+void armToZero(){
+  for (int i = 0; i < 6; i++){
+    Serial.print("Resetting Motor ");
+    Serial.print(i);
+    Serial.println(" To Zero");
+    linkAngles[i] = zeroLinkAngles[i];
+    motorControl(i + 1, 'n', linkAngles[i]);
+  }  
+}
+// Calibrate ACS712 module for reading powerscrew current
+void calibrateACS712() {
+  long sum = 0;
+
+  for (int i = 0; i < 500; i++) {
+    sum += abs(analogRead(ACS_PIN));
+    delay(2);
+  }
+
+  float avgADC = sum / 500.0;
+  zeroOffset = avgADC * (VREF / ADC_MAX);
+}
+
+// Read gripper current from ACS712 module
+float readCurrent() {
+  long sum = 0;
+
+  for (int i = 0; i < 40; i++) {
+    sum += analogRead(A0);
+  }
+
+  float voltage = (sum / 40.0) * (5.0 / 1023.0);
+  float current = (voltage - zeroOffset) / 0.066;
+
+  // Deadband to eliminate noise
+  if (abs(current) < 0.1) current = 0.0;
+
+  return current;
+}
+
+float readRMSCurrent() {
+  float sumSq = 0;
+
+  for (int i = 0; i < 300; i++) {
+    float voltage = analogRead(ACS_PIN) * (VREF / ADC_MAX);
+    current = (voltage - zeroOffset) / SENSITIVITY;
+    sumSq += current * current;
+  }
+
+  return sqrt(sumSq / 300.0);
+}
+
+// Motor Control function
+void motorControl(int motor, char act, int deg){
+  for (int i = 0; i < 2; i++){
+    selectedPins[i] = motorPins[(motor * 2) - (2 - i)];
+  }
+
+  // Move motor forward
+  if(act == 'f'){ 
+    Serial.print("Moving Forward");
+    Serial.println(" ");
+    digitalWrite(selectedPins[0], LOW);
+    digitalWrite(selectedPins[1], LOW);
+    delay(500);
+    digitalWrite(selectedPins[0], HIGH);
+    digitalWrite(selectedPins[1], LOW);
+    delay(currentDelay);
+    saveCurrent();
+
+    currentCheck = true;
+
+
+  // Move motor backward
+  }else if (act == 'b'){
+    Serial.print("Moving Backward");
+    Serial.println(" ");
+    digitalWrite(selectedPins[0], LOW);
+    digitalWrite(selectedPins[1], LOW);
+    delay(500);
+    digitalWrite(selectedPins[0], LOW);
+    digitalWrite(selectedPins[1], HIGH);
+    delay(currentDelay);
+    saveCurrent();
+
+    currentCheck = true;
+    
+
+  // Stop motor
+  }else if (act == 's'){
+    Serial.print("Stopping");
+    Serial.println(" ");
+    digitalWrite(selectedPins[0], LOW);
+    digitalWrite(selectedPins[1], LOW);
+
+    if(motor == 6){
+      calibrateACS712();
+    }
+
+  // Increase motor speed [if connected to en pins on L298N board]
+  }else if (act == 'm'){
+    if(motorSpeeds[motor - 1] < 255){
+        motorSpeeds[motor - 1] += 25.5;
+        analogWrite(enablePins[motor - 1], motorSpeeds[motor - 1]); // Speed control
+      }
+      
+      Serial.print("Motor Speed set to ");
+      Serial.println(motorSpeeds[motor - 1]);
+
+  // Decrease motor speed [if connected to en pins on L298N board]
+  }else if (act == 'l'){
+    if(motorSpeeds[motor - 1] > gobildaSpeedMin){
+      motorSpeeds[motor - 1] -= 25.5;
+      analogWrite(enablePins[motor - 1], motorSpeeds[motor - 1]); // Speed control
+    }
+        
+    Serial.print("Motor Speed set to:  ");
+    Serial.println(motorSpeeds[motor - 1]);
+
+  // Move motor to a certain angle
+  }else if (deg != lastLinkAngles[motor - 1]){
+    int degToMove = deg - lastLinkAngles[motor - 1];
+    int delta = abs(degToMove);
+
+    digitalWrite(selectedPins[0], LOW);
+    digitalWrite(selectedPins[1], LOW);
+
+    // No movement needed
+    if (delta == 0) return;
+
+    // Check limits
+    if (!(limitLinkAngles[motor - 1] <= deg && deg <= maxLinkAngles[motor - 1])){
+        Serial.println("Angle out of limits!");
+        validAngle = false;
+        return;
+    }
+
+    // Set motor direction
+    if (degToMove > 0){
+        digitalWrite(selectedPins[0], HIGH);
+        digitalWrite(selectedPins[1], LOW);
+    } else {
+        digitalWrite(selectedPins[0], LOW);
+        digitalWrite(selectedPins[1], HIGH);
+    }
+  
+    if (delta < degreeLimit[motor - 1]){
+      delta = delta + degreeLimit[motor - 1];
+      Serial.print("Moving ");
+      Serial.print(delta);
+      Serial.println(" degrees");
+      
+      delay(delta * msPerDeg[motor - 1]);
+
+      // Stop motor
+      digitalWrite(selectedPins[0], LOW);
+      digitalWrite(selectedPins[1], LOW);
+        
+      if (degToMove < 0){
+        lastLinkAngles[motor - 1] = lastLinkAngles[motor - 1] - delta; //Change the link angle to reflect the compensation  
+      }else{
+        lastLinkAngles[motor - 1] = lastLinkAngles[motor - 1] + delta; //Change the link angle to reflect the compensation  
+      } 
+      delay(500);
+      motorControl(motor, action, deg);
+
+    }else{
+      Serial.print("Moving ");
+      Serial.print(delta);
+      Serial.println(" degrees");
+      
+      delay(delta * msPerDeg[motor - 1]);   // motor runs here
+
+      // Stop motor
+      digitalWrite(selectedPins[0], LOW);
+      digitalWrite(selectedPins[1], LOW);
+      Serial.println("Joint has stopped turning");
+      
+      lastLinkAngles[motor - 1] = deg;
+    }
+  Serial.println(" ");
+  }
+}
+
+void typeKeyboard(String word){
+    lastLinkAngles[4] = 0;  // Reset wrist
+    lastLinkAngles[6] = 0;  // Reset gripper
+    currentRow = 3;
+
+    Serial.println("Typing...");
+
+    for (int i = 0; word[i] != '\0'; i++) {
+        LetterCoord c = mapper.getCoord(word[i]);
+        int row = c.r;
+        int col = c.c;
+        int off = c.o;
+
+        Serial.print("Letter: ");
+        Serial.print(c.letter);
+        Serial.print(" -> Row: ");
+        Serial.print(c.r);
+        Serial.print(" Column: ");
+        Serial.println(c.c);
+
+        // Move wrist if row changed
+        if(row != currentRow){
+          Serial.print("Adjusting Gripper to row: ");
+          Serial.println(row);
+          motorControl(4, 'n', row * 7.5);
+        } 
+
+        // Move gripper if column changed
+        if(col != currentColumn){
+          Serial.print("Adjusting Gripper to column: ");
+          Serial.println(col);
+          motorControl(6, 'n', col * lenBetweenKey + off);
+        }  
+
+        extendFinger();
+
+        currentRow = row;
+        currentColumn = col;
+        currentOffset = off;
+
+        // Delay between letters for visible typing
+        delay(200);  
+    }
+    // Return gripper to start position
+    motorControl(4, 'n', 0);
+    delay(200);
+    motorControl(6, 'b', -420);
+}
+
+void extendFinger(){
+  setSpeed(-1.0);   // Forward (your CW)
+  Serial.println("Servo Forward");
+
+  delay(runMs);
+  setSpeed(0);
+  delay(servoDelay);
+  setSpeed(1.0);
+  delay(runMs);
+  setSpeed(0);
+}
+
+void saveCurrent(){
+  lastCurrent = readRMSCurrent();
+  Serial.println(lastCurrent + currentGrip);
+}
+
+void loop() {
+  
+  float current = readRMSCurrent();  // use readCurrent() for DC
+
+  Serial.print("Current: ");
+  Serial.print(current, 2);
+  Serial.println(" A");
+
+  delay(200);
+ 
+
+  if (Serial.available() > 0) {
+  firstChar = Serial.read();  // Motor number
+
+  motor = firstChar - '0';
+
+  if (firstChar >= '1' && firstChar <= '6') {
+
+    motor = firstChar - '0';
+    while (!Serial.available());  // wait for next input
+    
+
+    char nextChar = Serial.peek();
+
+    if (nextChar == '-' || isDigit(nextChar)) {
+      int angle = Serial.parseInt();
+
+      linkAngles[motor - 1] = angle;
+      action = 'n';
+
+      Serial.print("Motor ");
+      Serial.print(motor);
+      Serial.print(" Degree: ");
+      Serial.println(angle);
+    }
+    
+    else {
+      action = Serial.read();  // f, b, s
+      Serial.print("Motor ");
+      Serial.print(motor);
+      Serial.print(" Action: ");
+      Serial.println(action);
+      
+      linkAngles[motor - 1] = -420;
+    }
+    
+      // Clear any leftover \r or \n
+      while (Serial.available()) {
+        char junk = Serial.read();
+        if (junk != '\r' && junk != '\n') {
+          // optionally warn or handle here
+        }
+      }
+
+      motorControl(motor, action, linkAngles[motor - 1]);
+      delay(500);
+      
+
+    }
+    else if(firstChar == 'k') {
+      String word = Serial.readStringUntil('\n');
+      Serial.println(word);
+      typeKeyboard(word);
+    }
+    // === Servo Command (s1f/s1b) === (Wrist)(f : +30deg; b : -30deg)
+    else {
+      String command = String(firstChar) + Serial.readStringUntil('\n');
+      command.trim();
+
+      if (command == "s1") {
+        currentGrip = gripSensitivities[0];
+
+        Serial.print("Grip Sensitivity set to: ");
+        Serial.println("Soft");
+          
+      }else if (command == "s2") {
+        currentGrip = gripSensitivities[1];
+
+        Serial.print("Grip Sensitivity set to: ");
+        Serial.println("Medium");
+          
+      }else if(command == "s3"){
+        currentGrip = gripSensitivities[2];
+
+        Serial.print("Grip Sensitivity set to: ");
+        Serial.println("Hard");
+      }
+      else if (command == "az") {
+        armToZero();
+      }
+
+      if (command == "sf") {
+        extendFinger();
+      }     
+    }
+  }
+
+  if ((current > lastCurrent + currentGrip) && currentCheck == true) {
+    Serial.println(lastCurrent + currentGrip);
+    motorControl(6, 's', -420);
+    Serial.println("OVERCURRENT! MOTOR STOPPED");
+    calibrateACS712();
+    currentCheck = false;
+  }
+}
